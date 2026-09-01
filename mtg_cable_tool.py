@@ -1,6 +1,8 @@
 import os
 import re
 import math
+import ctypes
+import sys
 from datetime import date
 import tkinter as tk
 import tkinter.font as tkfont
@@ -14,7 +16,18 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "MTG Cable Tool"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.3.3"
+EXTRACT_BLANK_ROW_STOP = 75
+
+# Union of worksheet source fields used anywhere in the application.
+# These are pre-cached when a sheet is first scanned so Single File,
+# Multiple Files / Sheets, and Cable Lengths can share the same raw data.
+SHARED_SOURCE_FIELDS = (
+    "a_position",
+    "z_position",
+    "cable_type",
+    "path",
+)
 
 OUTPUT_HEADERS = [
     "A Position",
@@ -163,95 +176,158 @@ def describe_detected_columns(ws, columns):
     return " | ".join(parts)
 
 
-def extract_labels(file_path, sheet_name=None, header_row_override=None, columns_override=None, progress_callback=None):
-    try:
-        workbook = load_workbook(file_path, data_only=True, read_only=True)
-    except Exception as exc:
-        raise RuntimeError(f"Could not open the Excel file.\n\n{exc}") from exc
-
-    labels = []
+def extract_labels(
+    file_path,
+    sheet_name=None,
+    header_row_override=None,
+    columns_override=None,
+    progress_callback=None,
+):
+    workbook = load_workbook(
+        file_path,
+        data_only=True,
+        read_only=True,
+    )
 
     try:
         if sheet_name:
             if sheet_name not in workbook.sheetnames:
                 raise RuntimeError(
-                    f'The worksheet "{sheet_name}" could not be found.'
+                    f'Worksheet "{sheet_name}" was not found.'
                 )
             worksheets = [workbook[sheet_name]]
         else:
-            worksheets = workbook.worksheets
+            worksheets = list(workbook.worksheets)
+
+        labels = []
 
         for ws in worksheets:
             if progress_callback:
                 progress_callback()
 
             if columns_override:
-                header_row = header_row_override
                 columns = dict(columns_override)
+                header_row = header_row_override or 1
             else:
                 header_row, columns = find_header_columns(ws)
 
             if not columns:
-                if sheet_name:
-                    raise RuntimeError(
-                        f'Worksheet "{ws.title}" does not contain the required columns:\n'
-                        "A Position, Z Position, and Cable Type.\n"
-                        "Path is optional."
-                    )
                 continue
 
-            for row_num in range(header_row + 1, ws.max_row + 1):
-                if progress_callback and row_num % 20 == 0:
+            required = (
+                "a_position",
+                "z_position",
+                "cable_type",
+            )
+
+            if not all(columns.get(key) for key in required):
+                continue
+
+            a_col = columns["a_position"]
+            z_col = columns["z_position"]
+            cable_col = columns["cable_type"]
+            path_col = columns.get("path")
+
+            # Only inspect columns that are actually needed.
+            needed_cols = {
+                a_col,
+                z_col,
+                cable_col,
+            }
+
+            if path_col:
+                needed_cols.add(path_col)
+
+            min_col = min(needed_cols)
+            max_col = max(needed_cols)
+
+            consecutive_blank_rows = 0
+            data_started = False
+
+            # Stop after a sustained blank run once cable data has begun.
+            BLANK_ROW_STOP = EXTRACT_BLANK_ROW_STOP
+
+            for row_num in range(
+                header_row + 1,
+                ws.max_row + 1,
+            ):
+                if progress_callback and row_num % 50 == 0:
                     progress_callback()
 
-                a_position = clean_value(
-                    ws.cell(row=row_num, column=columns["a_position"]).value
-                )
-                z_position = clean_value(
-                    ws.cell(row=row_num, column=columns["z_position"]).value
+                # Read only the mapped cells rather than the full worksheet row.
+                a_value = ws.cell(
+                    row=row_num,
+                    column=a_col,
+                ).value
+
+                z_value = ws.cell(
+                    row=row_num,
+                    column=z_col,
+                ).value
+
+                cable_value = ws.cell(
+                    row=row_num,
+                    column=cable_col,
+                ).value
+
+                path_value = (
+                    ws.cell(
+                        row=row_num,
+                        column=path_col,
+                    ).value
+                    if path_col
+                    else ""
                 )
 
-                # Ignore rows that contain neither endpoint.
-                if not a_position and not z_position:
+                a_position = clean_value(a_value)
+                z_position = clean_value(z_value)
+                cable_type = clean_value(cable_value)
+                path = clean_value(path_value)
+
+                # "Blank" is based only on the columns relevant to this tool.
+                row_is_blank = not any(
+                    (
+                        a_position,
+                        z_position,
+                        cable_type,
+                        path,
+                    )
+                )
+
+                if row_is_blank:
+                    if data_started:
+                        consecutive_blank_rows += 1
+
+                        if consecutive_blank_rows >= BLANK_ROW_STOP:
+                            break
+
                     continue
 
-                if "path" in columns:
-                    path_value = clean_value(
-                        ws.cell(row=row_num, column=columns["path"]).value
-                    )
-                else:
-                    path_value = ""
+                data_started = True
+                consecutive_blank_rows = 0
 
-                # Cable Type marks the start of one physical cable.
-                # Blank Cable Type rows are continuation rows.
-                cable_type = clean_value(
-                    ws.cell(row=row_num, column=columns["cable_type"]).value
-                )
-
+                # Cable Type marks the start of an actual cable row.
+                # Blank cable type rows are continuation rows and are skipped.
                 if not cable_type:
                     continue
 
                 labels.append(
                     {
                         "a_position": a_position,
-                        "path": path_value,
-                        "cable_type": simplify_cable_type(cable_type),
                         "z_position": z_position,
+                        "cable_type": simplify_cable_type(
+                            cable_type
+                        ),
+                        "path": path,
                         "source_sheet": ws.title,
                         "source_row": row_num,
                     }
                 )
+
+        return labels
+
     finally:
         workbook.close()
-
-    if not labels and not sheet_name:
-        raise RuntimeError(
-            "No worksheet contained the required columns:\n"
-            "A Position, Z Position, and Cable Type.\n"
-            "Path is optional."
-        )
-
-    return labels
 
 
 def write_output(
@@ -1409,6 +1485,22 @@ def write_cable_length_output(output_path, summary_rows, raw_records):
     wb.save(output_path)
 
 
+def set_windows_app_identity():
+    """Give the packaged app a stable Windows taskbar identity."""
+    if not sys.platform.startswith("win"):
+        return
+
+    try:
+        app_id = "MTG.MTGCableTool"
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            app_id
+        )
+    except Exception:
+        # Do not prevent the program from opening if Windows does not
+        # support the API or the call fails for any reason.
+        pass
+
+
 class LabelGeneratorApp:
     def __init__(self, root):
         self.root = root
@@ -1427,6 +1519,12 @@ class LabelGeneratorApp:
 
         self.current_header_row = None
         self.current_auto_columns = {}
+
+        # Shared spreadsheet caches used by all three tabs.
+        # Cache entries automatically invalidate when a source file's
+        # modification time or size changes.
+        self.workbook_cache = {}
+        self.label_cache = {}
 
         # Batch / multi-file workflow state.
         self.batch_items = []
@@ -1490,6 +1588,385 @@ class LabelGeneratorApp:
         self.status_text = tk.StringVar(value="Select an Excel file to begin.")
 
         self.build_ui()
+
+    def file_cache_signature(self, file_path):
+        try:
+            stat = os.stat(file_path)
+            return (
+                stat.st_mtime_ns,
+                stat.st_size,
+            )
+        except OSError:
+            return None
+
+    def normalized_cache_path(self, file_path):
+        return os.path.normcase(
+            os.path.abspath(file_path)
+        )
+
+    def invalidate_file_cache_if_changed(self, file_path):
+        normalized = self.normalized_cache_path(file_path)
+        signature = self.file_cache_signature(file_path)
+
+        cached = self.workbook_cache.get(normalized)
+
+        if cached and cached.get("signature") != signature:
+            self.workbook_cache.pop(normalized, None)
+
+            stale_keys = [
+                key
+                for key in self.label_cache
+                if key[0] == normalized
+            ]
+
+            for key in stale_keys:
+                self.label_cache.pop(key, None)
+
+        return normalized, signature
+
+    def cache_sheet_from_open_worksheet(
+        self,
+        file_path,
+        ws,
+        header_row=None,
+        columns=None,
+        include_preview=False,
+    ):
+        normalized, signature = self.invalidate_file_cache_if_changed(
+            file_path
+        )
+
+        workbook_entry = self.workbook_cache.setdefault(
+            normalized,
+            {
+                "signature": signature,
+                "sheet_names": [],
+                "sheets": {},
+            },
+        )
+        workbook_entry["signature"] = signature
+
+        if ws.title not in workbook_entry["sheet_names"]:
+            workbook_entry["sheet_names"].append(ws.title)
+
+        if header_row is None or columns is None:
+            header_row, columns = find_header_columns(ws)
+
+        sheet_entry = workbook_entry["sheets"].setdefault(
+            ws.title,
+            {},
+        )
+
+        sheet_entry["header_row"] = header_row
+        sheet_entry["auto_columns"] = dict(columns or {})
+        sheet_entry["max_column"] = ws.max_column
+        sheet_entry["max_row"] = ws.max_row
+
+        if header_row:
+            choices = []
+            choice_by_col = {}
+
+            for col_num in range(1, ws.max_column + 1):
+                choice = self.column_choice(
+                    col_num,
+                    ws.cell(
+                        row=header_row,
+                        column=col_num,
+                    ).value,
+                )
+                choices.append(choice)
+                choice_by_col[col_num] = choice
+
+            sheet_entry["choices"] = choices
+            sheet_entry["choice_by_col"] = choice_by_col
+
+            # Pre-cache the union of source columns used by all tabs.
+            shared_columns = {
+                key: columns.get(key)
+                for key in SHARED_SOURCE_FIELDS
+                if columns.get(key)
+            }
+
+            sheet_entry["shared_columns"] = dict(shared_columns)
+
+            if all(
+                shared_columns.get(key)
+                for key in (
+                    "a_position",
+                    "z_position",
+                    "cable_type",
+                )
+            ):
+                raw_rows = []
+                data_started = False
+                blank_run = 0
+
+                for row_num in range(
+                    header_row + 1,
+                    ws.max_row + 1,
+                ):
+                    row_values = {}
+
+                    for key, col_num in shared_columns.items():
+                        row_values[key] = clean_value(
+                            ws.cell(
+                                row=row_num,
+                                column=col_num,
+                            ).value
+                        )
+
+                    row_is_blank = not any(
+                        row_values.get(key, "")
+                        for key in SHARED_SOURCE_FIELDS
+                    )
+
+                    if row_is_blank:
+                        if data_started:
+                            blank_run += 1
+
+                            if blank_run >= EXTRACT_BLANK_ROW_STOP:
+                                break
+
+                        continue
+
+                    data_started = True
+                    blank_run = 0
+
+                    raw_rows.append(
+                        {
+                            "row_num": row_num,
+                            "values": row_values,
+                        }
+                    )
+
+                sheet_entry["shared_raw_rows"] = raw_rows
+
+        return sheet_entry
+
+
+    def get_cached_workbook_overview(
+        self,
+        file_path,
+        include_preview_sheet=None,
+    ):
+        normalized, signature = self.invalidate_file_cache_if_changed(
+            file_path
+        )
+
+        cached = self.workbook_cache.get(normalized)
+
+        if (
+            cached
+            and cached.get("signature") == signature
+            and cached.get("overview_complete")
+        ):
+            return cached
+
+        workbook = load_workbook(
+            file_path,
+            data_only=True,
+            read_only=True,
+        )
+
+        try:
+            self.workbook_cache[normalized] = {
+                "signature": signature,
+                "sheet_names": list(workbook.sheetnames),
+                "sheets": {},
+                "overview_complete": False,
+            }
+
+            for ws in workbook.worksheets:
+                self.cache_sheet_from_open_worksheet(
+                    file_path,
+                    ws,
+                )
+
+            entry = self.workbook_cache[normalized]
+            entry["overview_complete"] = True
+            return entry
+
+        finally:
+            workbook.close()
+
+    def get_cached_sheet_info(
+        self,
+        file_path,
+        sheet_name,
+        include_preview=False,
+    ):
+        normalized, signature = self.invalidate_file_cache_if_changed(
+            file_path
+        )
+
+        cached = self.workbook_cache.get(normalized)
+        sheet_entry = None
+
+        if cached and cached.get("signature") == signature:
+            sheet_entry = cached.get("sheets", {}).get(sheet_name)
+
+            if sheet_entry:
+                return sheet_entry
+
+        workbook = load_workbook(
+            file_path,
+            data_only=True,
+            read_only=True,
+        )
+
+        try:
+            if sheet_name not in workbook.sheetnames:
+                raise RuntimeError(
+                    f'Worksheet "{sheet_name}" was not found.'
+                )
+
+            ws = workbook[sheet_name]
+
+            return self.cache_sheet_from_open_worksheet(
+                file_path,
+                ws,
+                include_preview=include_preview,
+            )
+
+        finally:
+            workbook.close()
+
+    def cached_extract_labels(
+        self,
+        file_path,
+        sheet_name=None,
+        header_row_override=None,
+        columns_override=None,
+        progress_callback=None,
+    ):
+        normalized, signature = self.invalidate_file_cache_if_changed(
+            file_path
+        )
+
+        column_key = tuple(
+            sorted(
+                (columns_override or {}).items()
+            )
+        )
+
+        key = (
+            normalized,
+            sheet_name or "",
+            header_row_override,
+            column_key,
+            signature,
+        )
+
+        cached = self.label_cache.get(key)
+
+        if cached is not None:
+            return [
+                dict(label)
+                for label in cached
+            ]
+
+        # Fast path: if this request uses the sheet's detected shared
+        # A/Z/Cable Type/Path mapping, build the result entirely from RAM.
+        labels = None
+
+        if sheet_name and columns_override:
+            try:
+                info = self.get_cached_sheet_info(
+                    file_path,
+                    sheet_name,
+                )
+
+                shared_columns = dict(
+                    info.get("shared_columns", {})
+                )
+                shared_rows = info.get("shared_raw_rows")
+
+                requested_columns = {
+                    key: value
+                    for key, value in columns_override.items()
+                    if value
+                }
+
+                mapping_matches_cache = all(
+                    shared_columns.get(key) == col_num
+                    for key, col_num in requested_columns.items()
+                )
+
+                required_present = all(
+                    requested_columns.get(key)
+                    for key in (
+                        "a_position",
+                        "z_position",
+                        "cable_type",
+                    )
+                )
+
+                header_matches = (
+                    header_row_override is None
+                    or header_row_override == info.get("header_row")
+                )
+
+                if (
+                    shared_rows is not None
+                    and mapping_matches_cache
+                    and required_present
+                    and header_matches
+                ):
+                    labels = []
+
+                    for raw in shared_rows:
+                        values = raw["values"]
+                        cable_type = clean_value(
+                            values.get("cable_type", "")
+                        )
+
+                        # Blank Cable Type means continuation row.
+                        if not cable_type:
+                            continue
+
+                        labels.append(
+                            {
+                                "a_position": clean_value(
+                                    values.get("a_position", "")
+                                ),
+                                "z_position": clean_value(
+                                    values.get("z_position", "")
+                                ),
+                                "cable_type": simplify_cable_type(
+                                    cable_type
+                                ),
+                                "path": clean_value(
+                                    values.get("path", "")
+                                ),
+                                "source_sheet": sheet_name,
+                                "source_row": raw["row_num"],
+                            }
+                        )
+
+            except Exception:
+                labels = None
+
+        # Fallback for manual mappings or any request not covered by the
+        # shared detected-column cache.
+        if labels is None:
+            labels = extract_labels(
+                file_path,
+                sheet_name,
+                header_row_override=header_row_override,
+                columns_override=columns_override,
+                progress_callback=progress_callback,
+            )
+
+        self.label_cache[key] = [
+            dict(label)
+            for label in labels
+        ]
+
+        return [
+            dict(label)
+            for label in labels
+        ]
+
 
     def sanitize_filename_part(self, value):
         value = clean_value(value).strip()
@@ -1963,39 +2440,15 @@ class LabelGeneratorApp:
             command=self.clear_fields,
         ).pack(side="right")
 
-        preview_notebook = ttk.Notebook(main)
-        preview_notebook.pack(fill="both", expand=True)
-
-        source_preview_frame = ttk.Frame(preview_notebook)
-        output_preview_frame = ttk.Frame(preview_notebook)
-
-        preview_notebook.add(source_preview_frame, text="Source")
-        preview_notebook.add(output_preview_frame, text="Output")
-        preview_notebook.select(output_preview_frame)
-
-        self.source_preview = ttk.Treeview(
-            source_preview_frame,
-            show="headings",
+        output_preview_frame = ttk.LabelFrame(
+            main,
+            text="Output Preview",
+            padding=8,
         )
-        source_v = ttk.Scrollbar(
-            source_preview_frame,
-            orient="vertical",
-            command=self.source_preview.yview,
+        output_preview_frame.pack(
+            fill="both",
+            expand=True,
         )
-        source_h = ttk.Scrollbar(
-            source_preview_frame,
-            orient="horizontal",
-            command=self.source_preview.xview,
-        )
-        self.source_preview.configure(
-            yscrollcommand=source_v.set,
-            xscrollcommand=source_h.set,
-        )
-        self.source_preview.grid(row=0, column=0, sticky="nsew")
-        source_v.grid(row=0, column=1, sticky="ns")
-        source_h.grid(row=1, column=0, sticky="ew")
-        source_preview_frame.rowconfigure(0, weight=1)
-        source_preview_frame.columnconfigure(0, weight=1)
 
         self.output_preview = ttk.Treeview(
             output_preview_frame,
@@ -2366,7 +2819,7 @@ class LabelGeneratorApp:
             text="Files and Worksheets",
             padding=8,
         )
-        list_frame.pack(fill="x", pady=(0, 8))
+        list_frame.pack(fill="both", expand=True, pady=(0, 8))
 
         columns = (
             "include",
@@ -2385,7 +2838,6 @@ class LabelGeneratorApp:
             columns=columns,
             show="headings",
             selectmode="extended",
-            height=7,
         )
 
         headings = {
@@ -2412,6 +2864,14 @@ class LabelGeneratorApp:
         self.length_tree.column("include", width=90, stretch=False)
         self.length_tree.column("file", anchor="w")
         self.length_tree.column("sheet", anchor="w")
+
+        length_style = ttk.Style()
+        length_style.configure(
+            "Length.Treeview",
+            font=("TkDefaultFont", 10, "bold"),
+            rowheight=26,
+        )
+        self.length_tree.configure(style="Length.Treeview")
 
         length_v = ttk.Scrollbar(
             list_frame,
@@ -2445,15 +2905,15 @@ class LabelGeneratorApp:
             self.length_load_selected,
         )
 
-        settings_row = ttk.Frame(main)
-        settings_row.pack(fill="x", pady=(0, 8))
+        editor = ttk.Frame(main)
+        editor.pack(fill="x", pady=(0, 8))
 
-        sheet_frame = ttk.LabelFrame(
-            settings_row,
-            text="Selected Worksheet",
+        settings_frame = ttk.LabelFrame(
+            editor,
+            text="Selected Worksheet Settings",
             padding=10,
         )
-        sheet_frame.pack(
+        settings_frame.pack(
             side="left",
             fill="both",
             expand=True,
@@ -2461,7 +2921,7 @@ class LabelGeneratorApp:
         )
 
         ttk.Label(
-            sheet_frame,
+            settings_frame,
             text="Building:",
         ).grid(
             row=0,
@@ -2472,7 +2932,7 @@ class LabelGeneratorApp:
         )
 
         self.length_building_combo = ttk.Combobox(
-            sheet_frame,
+            settings_frame,
             textvariable=self.length_building,
             values=tuple(self.length_configs.keys()),
             state="readonly",
@@ -2484,21 +2944,46 @@ class LabelGeneratorApp:
             pady=3,
         )
 
+        settings_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(
+            settings_frame,
+            text="Apply to Selected",
+            command=self.length_apply_selected,
+        ).grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="e",
+            pady=(8, 0),
+        )
+
+        mapping_frame = ttk.LabelFrame(
+            editor,
+            text="Selected Worksheet Column Mapping",
+            padding=10,
+        )
+        mapping_frame.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=(5, 0),
+        )
+
         mapping_fields = [
             ("A Position", self.length_a_column, "a_position"),
             ("Z Position", self.length_z_column, "z_position"),
             ("Cable Type", self.length_cable_type_column, "cable_type"),
-            ("Path", self.length_path_column, "path"),
+            ("Path (blank = A)", self.length_path_column, "path"),
         ]
 
         self.length_mapping_combos = {}
 
         for row_num, (label_text, variable, key) in enumerate(
-            mapping_fields,
-            start=1,
+            mapping_fields
         ):
             ttk.Label(
-                sheet_frame,
+                mapping_frame,
                 text=label_text + ":",
             ).grid(
                 row=row_num,
@@ -2509,7 +2994,7 @@ class LabelGeneratorApp:
             )
 
             combo = ttk.Combobox(
-                sheet_frame,
+                mapping_frame,
                 textvariable=variable,
                 state="readonly",
             )
@@ -2521,25 +3006,25 @@ class LabelGeneratorApp:
             )
             self.length_mapping_combos[key] = combo
 
-        sheet_frame.columnconfigure(1, weight=1)
+        mapping_frame.columnconfigure(1, weight=1)
 
         ttk.Button(
-            sheet_frame,
-            text="Apply Worksheet Settings",
+            mapping_frame,
+            text="Apply Column Mapping",
             command=self.length_apply_selected,
         ).grid(
-            row=5,
+            row=len(mapping_fields),
             column=0,
             columnspan=2,
             sticky="e",
             pady=(8, 0),
         )
 
-        config_controls = ttk.Frame(settings_row)
+        config_controls = ttk.Frame(editor)
         config_controls.pack(
             side="left",
             fill="y",
-            padx=(5, 0),
+            padx=(10, 0),
         )
 
         self.length_edit_buildings_button = ttk.Button(
@@ -2760,22 +3245,12 @@ class LabelGeneratorApp:
             if not item.get("include", True):
                 continue
 
-            try:
-                labels = extract_labels(
-                    item["file_path"],
-                    item["sheet"],
-                    header_row_override=item["header_row"],
-                    columns_override=item["columns"],
-                )
-            except Exception:
-                continue
-
-            for label in labels:
-                cable_type = clean_value(label.get("cable_type", ""))
-                if cable_type:
-                    cable_types.append(cable_type)
+            cable_types.extend(
+                item.get("cached_cable_types", [])
+            )
 
         return cable_types
+
 
     def length_refresh_filter_choices(self):
         cable_types = self.length_collect_loaded_cable_types()
@@ -2870,70 +3345,123 @@ class LabelGeneratorApp:
                 if file_path in self.length_file_paths:
                     continue
 
-                workbook = load_workbook(
-                    file_path,
-                    data_only=True,
-                    read_only=True,
+                overview = self.get_cached_workbook_overview(
+                    file_path
                 )
 
-                try:
-                    for ws in workbook.worksheets:
-                        header_row, columns = find_header_columns(ws)
+                for sheet_name in overview.get(
+                    "sheet_names",
+                    [],
+                ):
+                    info = overview.get(
+                        "sheets",
+                        {},
+                    ).get(
+                        sheet_name,
+                        {},
+                    )
 
-                        if not columns:
-                            continue
-
-                        try:
-                            labels = extract_labels(
-                                file_path,
-                                ws.title,
-                                header_row_override=header_row,
-                                columns_override=columns,
-                            )
-                        except Exception:
-                            labels = []
-
-                        building = infer_building_from_text(
-                            os.path.basename(file_path),
-                            ws.title,
+                    header_row = info.get("header_row")
+                    columns = dict(
+                        info.get(
+                            "auto_columns",
+                            {},
                         )
+                    )
 
-                        length_item = {
-                            "include": True,
-                            "file_path": file_path,
-                            "file_name": os.path.basename(file_path),
-                            "sheet": ws.title,
-                            "header_row": header_row,
-                            "columns": dict(columns),
-                            "building": building,
-                            "count": len(labels),
-                            "project_number": "",
-                            "identifier": "",
-                            "other": "",
-                        }
+                    if not columns:
+                        continue
 
-                        batch_metadata = self.find_batch_metadata_for_sheet(
+                    try:
+                        labels = self.cached_extract_labels(
+                            file_path,
+                            sheet_name,
+                            header_row_override=header_row,
+                            columns_override=columns,
+                        )
+                    except Exception:
+                        labels = []
+
+                    cached_cable_types = [
+                        clean_value(
+                            label.get(
+                                "cable_type",
+                                "",
+                            )
+                        )
+                        for label in labels
+                        if clean_value(
+                            label.get(
+                                "cable_type",
+                                "",
+                            )
+                        )
+                    ]
+
+                    cached_column_choices = list(
+                        info.get(
+                            "choices",
+                            [],
+                        )
+                    )
+                    cached_choice_by_col = dict(
+                        info.get(
+                            "choice_by_col",
+                            {},
+                        )
+                    )
+
+                    building = infer_building_from_text(
+                        os.path.basename(file_path),
+                        sheet_name,
+                    )
+
+                    length_item = {
+                        "include": True,
+                        "file_path": file_path,
+                        "file_name": os.path.basename(
+                            file_path
+                        ),
+                        "sheet": sheet_name,
+                        "header_row": header_row,
+                        "columns": columns,
+                        "building": building,
+                        "count": len(labels),
+                        "project_number": "",
+                        "identifier": "",
+                        "other": "",
+                        "cached_cable_types": cached_cable_types,
+                        "cached_column_choices": cached_column_choices,
+                        "cached_choice_by_col": cached_choice_by_col,
+                    }
+
+                    batch_metadata = (
+                        self.find_batch_metadata_for_sheet(
                             length_item
                         )
+                    )
 
-                        if batch_metadata is not length_item:
-                            length_item["project_number"] = batch_metadata.get(
+                    if batch_metadata is not length_item:
+                        length_item["project_number"] = (
+                            batch_metadata.get(
                                 "project_number",
                                 "",
                             )
-                            length_item["identifier"] = batch_metadata.get(
+                        )
+                        length_item["identifier"] = (
+                            batch_metadata.get(
                                 "identifier",
                                 "",
                             )
-                            length_item["other"] = batch_metadata.get(
+                        )
+                        length_item["other"] = (
+                            batch_metadata.get(
                                 "other",
                                 "",
                             )
+                        )
 
-                        self.length_items.append(length_item)
-
-                finally:
-                    workbook.close()
+                    self.length_items.append(length_item)
 
                 self.length_file_paths.append(file_path)
 
@@ -2941,7 +3469,8 @@ class LabelGeneratorApp:
             self.length_refresh_filter_choices()
 
             self.status_text.set(
-                f"Cable Lengths: {len(self.length_items)} worksheet(s) loaded."
+                f"Cable Lengths: "
+                f"{len(self.length_items)} worksheet(s) loaded."
             )
 
         except Exception as exc:
@@ -2951,6 +3480,7 @@ class LabelGeneratorApp:
             )
         finally:
             self.stop_loading()
+
 
     def length_remove_selected(self):
         selected = list(self.length_tree.selection())
@@ -3068,54 +3598,56 @@ class LabelGeneratorApp:
 
     def length_setup_mapping_choices(self, item):
         try:
-            workbook = load_workbook(
-                item["file_path"],
-                data_only=True,
-                read_only=True,
+            choices = list(
+                item.get("cached_column_choices", [])
+            )
+            choice_by_col = dict(
+                item.get("cached_choice_by_col", {})
             )
 
-            try:
-                ws = workbook[item["sheet"]]
-                choices = []
-                choice_by_col = {}
+            if not choices:
+                info = self.get_cached_sheet_info(
+                    item["file_path"],
+                    item["sheet"],
+                )
+                choices = list(info.get("choices", []))
+                choice_by_col = dict(
+                    info.get("choice_by_col", {})
+                )
 
-                for col_num in range(1, ws.max_column + 1):
-                    choice = self.column_choice(
-                        col_num,
-                        ws.cell(
-                            row=item["header_row"],
-                            column=col_num,
-                        ).value,
+                item["cached_column_choices"] = list(choices)
+                item["cached_choice_by_col"] = dict(
+                    choice_by_col
+                )
+
+            variables = {
+                "a_position": self.length_a_column,
+                "z_position": self.length_z_column,
+                "cable_type": self.length_cable_type_column,
+                "path": self.length_path_column,
+            }
+
+            for key, combo in self.length_mapping_combos.items():
+                combo["values"] = list(choices)
+
+                col_num = item["columns"].get(key)
+
+                if col_num:
+                    variables[key].set(
+                        choice_by_col.get(
+                            col_num,
+                            "",
+                        )
                     )
-                    choices.append(choice)
-                    choice_by_col[col_num] = choice
-
-                variables = {
-                    "a_position": self.length_a_column,
-                    "z_position": self.length_z_column,
-                    "cable_type": self.length_cable_type_column,
-                    "path": self.length_path_column,
-                }
-
-                for key, combo in self.length_mapping_combos.items():
-                    values = list(choices)
-                    combo["values"] = values
-
-                    col_num = item["columns"].get(key)
-
-                    if col_num:
-                        variables[key].set(choice_by_col[col_num])
-                    else:
-                        variables[key].set("")
-
-            finally:
-                workbook.close()
+                else:
+                    variables[key].set("")
 
         except Exception as exc:
             messagebox.showerror(
                 APP_NAME,
                 f"Could not load worksheet columns.\n\n{exc}",
             )
+
 
     def length_get_selected_columns(self):
         columns = {
@@ -3133,7 +3665,11 @@ class LabelGeneratorApp:
         path_col = self.choice_to_column(
             self.length_path_column.get()
         )
-        columns["path"] = path_col
+
+        if path_col:
+            columns["path"] = path_col
+        else:
+            columns.pop("path", None)
 
         if not all(
             columns.get(key)
@@ -3141,11 +3677,10 @@ class LabelGeneratorApp:
                 "a_position",
                 "z_position",
                 "cable_type",
-                "path",
             )
         ):
             raise RuntimeError(
-                "Select A Position, Z Position, Cable Type, and Path columns."
+                "Select A Position, Z Position, and Cable Type columns."
             )
 
         return columns
@@ -3169,13 +3704,18 @@ class LabelGeneratorApp:
         item["building"] = self.length_building.get()
 
         try:
-            labels = extract_labels(
+            labels = self.cached_extract_labels(
                 item["file_path"],
                 item["sheet"],
                 header_row_override=item["header_row"],
                 columns_override=columns,
             )
             item["count"] = len(labels)
+            item["cached_cable_types"] = [
+                clean_value(label.get("cable_type", ""))
+                for label in labels
+                if clean_value(label.get("cable_type", ""))
+            ]
         except Exception as exc:
             messagebox.showerror(
                 APP_NAME,
@@ -3186,6 +3726,7 @@ class LabelGeneratorApp:
         self.length_rebuild_tree(
             select_index=self.length_selected_index
         )
+        self.length_refresh_filter_choices()
 
     def length_load_config(self, event=None):
         building = self.length_config_building.get() or "Default"
@@ -3241,15 +3782,9 @@ class LabelGeneratorApp:
             if not item["include"]:
                 continue
 
-            if not item["columns"].get("path"):
-                raise RuntimeError(
-                    f'Path column is required for Cable Lengths:\n'
-                    f'{item["file_name"]} / {item["sheet"]}'
-                )
-
             config = self.length_configs[item["building"]]
 
-            labels = extract_labels(
+            labels = self.cached_extract_labels(
                 item["file_path"],
                 item["sheet"],
                 header_row_override=item["header_row"],
@@ -3603,91 +4138,6 @@ class LabelGeneratorApp:
                 stretch=True,
             )
 
-    def load_source_preview(self):
-        self.clear_tree(self.source_preview)
-
-        source = self.file_path.get().strip()
-        sheet_name = self.sheet_name.get().strip()
-
-        if not source or not sheet_name:
-            self.source_preview["columns"] = ()
-            return
-
-        workbook = load_workbook(
-            source,
-            data_only=True,
-            read_only=True,
-        )
-
-        try:
-            ws = workbook[sheet_name]
-            max_cols = min(ws.max_column, 40)
-
-            column_ids = [
-                f"c{i}"
-                for i in range(1, max_cols + 1)
-            ]
-            self.source_preview["columns"] = column_ids
-
-            header_row = self.current_header_row or 1
-
-            for col_num, col_id in enumerate(column_ids, start=1):
-                header = clean_value(
-                    ws.cell(
-                        row=header_row,
-                        column=col_num,
-                    ).value
-                )
-                letter = get_column_letter(col_num)
-
-                display = (
-                    f"{letter} - {header}"
-                    if header
-                    else letter
-                )
-
-                self.source_preview.heading(
-                    col_id,
-                    text=display,
-                )
-                self.source_preview.column(
-                    col_id,
-                    anchor="w",
-                    width=90,
-                )
-
-            start_row = header_row + 1
-            end_row = min(
-                ws.max_row,
-                start_row + 199,
-            )
-
-            for row_num in range(start_row, end_row + 1):
-                values = [
-                    clean_value(
-                        ws.cell(
-                            row=row_num,
-                            column=col_num,
-                        ).value
-                    )
-                    for col_num in range(1, max_cols + 1)
-                ]
-
-                self.source_preview.insert(
-                    "",
-                    "end",
-                    values=values,
-                )
-
-        finally:
-            workbook.close()
-
-        self.autosize_tree_columns(
-            self.source_preview,
-            min_width=60,
-            max_width=280,
-        )
-
 
     def on_output_type_changed(self, event=None):
         self.start_loading("Changing output type...")
@@ -3716,7 +4166,7 @@ class LabelGeneratorApp:
 
         columns = self.get_selected_columns()
 
-        return extract_labels(
+        return self.cached_extract_labels(
             source,
             sheet_name,
             header_row_override=self.current_header_row,
@@ -3895,7 +4345,6 @@ class LabelGeneratorApp:
     def refresh_previews(self):
         self.start_loading("Refreshing preview...")
         try:
-            self.load_source_preview()
             self.load_output_preview()
         except Exception as exc:
             messagebox.showerror(
@@ -3922,30 +4371,43 @@ class LabelGeneratorApp:
 
         self.start_loading("Loading files...")
 
-        for file_path in selected:
-            self.pulse_loading()
-
-            if file_path in self.batch_file_paths:
-                continue
-
-            try:
-                workbook = load_workbook(
-                    file_path,
-                    data_only=True,
-                    read_only=True,
-                )
+        try:
+            for file_path in selected:
+                if file_path in self.batch_file_paths:
+                    continue
 
                 try:
-                    for ws in workbook.worksheets:
-                        self.pulse_loading()
-                        header_row, columns = find_header_columns(ws)
+                    overview = self.get_cached_workbook_overview(
+                        file_path
+                    )
+
+                    for sheet_name in overview.get(
+                        "sheet_names",
+                        [],
+                    ):
+                        info = overview.get(
+                            "sheets",
+                            {},
+                        ).get(
+                            sheet_name,
+                            {},
+                        )
+
+                        header_row = info.get("header_row")
+                        columns = dict(
+                            info.get(
+                                "auto_columns",
+                                {},
+                            )
+                        )
+
                         if not columns:
                             continue
 
                         try:
-                            labels = extract_labels(
+                            labels = self.cached_extract_labels(
                                 file_path,
-                                ws.title,
+                                sheet_name,
                                 header_row_override=header_row,
                                 columns_override=columns,
                                 progress_callback=self.pulse_loading,
@@ -3957,10 +4419,12 @@ class LabelGeneratorApp:
                             {
                                 "include": True,
                                 "file_path": file_path,
-                                "file_name": os.path.basename(file_path),
-                                "sheet": ws.title,
+                                "file_name": os.path.basename(
+                                    file_path
+                                ),
+                                "sheet": sheet_name,
                                 "header_row": header_row,
-                                "columns": dict(columns),
+                                "columns": columns,
                                 "count": len(labels),
                                 "project_number": "",
                                 "cable_start": 1,
@@ -3968,24 +4432,24 @@ class LabelGeneratorApp:
                                 "other": "",
                             }
                         )
-                finally:
-                    workbook.close()
 
-                self.batch_file_paths.append(file_path)
+                    self.batch_file_paths.append(file_path)
 
-            except Exception as exc:
-                messagebox.showerror(
-                    APP_NAME,
-                    f"Could not read:\n{file_path}\n\n{exc}",
-                )
+                except Exception as exc:
+                    messagebox.showerror(
+                        APP_NAME,
+                        f"Could not read:\n{file_path}\n\n{exc}",
+                    )
 
-        self.rebuild_batch_tree()
+            self.rebuild_batch_tree()
 
-        self.status_text.set(
-            f"Batch list contains {len(self.batch_items)} worksheet(s)."
-        )
-        self.pulse_loading()
-        self.stop_loading()
+            self.status_text.set(
+                f"Batch list contains "
+                f"{len(self.batch_items)} worksheet(s)."
+            )
+
+        finally:
+            self.stop_loading()
 
 
     def batch_load_selected_settings(self, event=None):
@@ -4019,72 +4483,52 @@ class LabelGeneratorApp:
         self.batch_setup_mapping_choices(item)
 
     def batch_setup_mapping_choices(self, item):
-        self.start_loading("Loading columns...")
-
         try:
-            workbook = load_workbook(
+            info = self.get_cached_sheet_info(
                 item["file_path"],
-                data_only=True,
-                read_only=True,
+                item["sheet"],
             )
 
-            try:
-                ws = workbook[item["sheet"]]
-                header_row = item["header_row"]
+            choices = list(info.get("choices", []))
+            choice_by_col = dict(
+                info.get("choice_by_col", {})
+            )
 
-                choices = []
-                choice_by_col = {}
+            variables = {
+                "a_position": self.batch_a_column,
+                "z_position": self.batch_z_column,
+                "cable_type": self.batch_cable_type_column,
+                "path": self.batch_path_column,
+            }
 
-                for col_num in range(
-                    1,
-                    ws.max_column + 1,
-                ):
-                    choice = self.column_choice(
-                        col_num,
-                        ws.cell(
-                            row=header_row,
-                            column=col_num,
-                        ).value,
-                    )
-                    choices.append(choice)
-                    choice_by_col[col_num] = choice
+            for key, combo in self.batch_mapping_combos.items():
+                combo_values = list(choices)
 
-                variables = {
-                    "a_position": self.batch_a_column,
-                    "z_position": self.batch_z_column,
-                    "cable_type": self.batch_cable_type_column,
-                    "path": self.batch_path_column,
-                }
+                if key == "path":
+                    combo_values = ["(None)"] + combo_values
 
-                for key, combo in self.batch_mapping_combos.items():
-                    combo_values = list(choices)
+                combo["values"] = combo_values
 
-                    if key == "path":
-                        combo_values = ["(None)"] + combo_values
+                col_num = item["columns"].get(key)
 
-                    combo["values"] = combo_values
-
-                    col_num = item["columns"].get(key)
-
-                    if col_num:
-                        variables[key].set(
-                            choice_by_col[col_num]
+                if col_num:
+                    variables[key].set(
+                        choice_by_col.get(
+                            col_num,
+                            "",
                         )
-                    elif key == "path":
-                        variables[key].set("(None)")
-                    else:
-                        variables[key].set("")
-
-            finally:
-                workbook.close()
+                    )
+                elif key == "path":
+                    variables[key].set("(None)")
+                else:
+                    variables[key].set("")
 
         except Exception as exc:
             messagebox.showerror(
                 APP_NAME,
                 f"Could not load column mapping.\n\n{exc}",
             )
-        finally:
-            self.stop_loading()
+
 
     def get_batch_selected_columns(self):
         columns = {
@@ -4228,7 +4672,7 @@ class LabelGeneratorApp:
         try:
             item["columns"] = columns
 
-            labels = extract_labels(
+            labels = self.cached_extract_labels(
                 item["file_path"],
                 item["sheet"],
                 header_row_override=item["header_row"],
@@ -4403,7 +4847,7 @@ class LabelGeneratorApp:
             if not item["include"]:
                 continue
 
-            labels = extract_labels(
+            labels = self.cached_extract_labels(
                 item["file_path"],
                 item["sheet"],
                 header_row_override=item["header_row"],
@@ -4564,44 +5008,35 @@ class LabelGeneratorApp:
         self.file_path.set(selected)
 
         try:
-            workbook = load_workbook(
-                selected,
-                data_only=True,
-                read_only=True,
+            overview = self.get_cached_workbook_overview(selected)
+            sheet_names = list(
+                overview.get("sheet_names", [])
             )
 
-            try:
-                sheet_names = list(workbook.sheetnames)
+            if not sheet_names:
+                raise RuntimeError(
+                    "The workbook does not contain any worksheets."
+                )
 
-                if not sheet_names:
-                    raise RuntimeError(
-                        "The workbook does not contain any worksheets."
+            default_sheet = sheet_names[0]
+
+            for candidate in sheet_names:
+                info = overview.get("sheets", {}).get(
+                    candidate,
+                    {},
+                )
+                columns = info.get("auto_columns", {})
+
+                if all(
+                    columns.get(key)
+                    for key in (
+                        "a_position",
+                        "z_position",
+                        "cable_type",
                     )
-
-                default_sheet = sheet_names[0]
-
-                # Prefer the first worksheet that contains all required
-                # columns for the Single File workflow.
-                for ws in workbook.worksheets:
-                    header_row, columns = find_header_columns(ws)
-
-                    if (
-                        header_row
-                        and columns
-                        and all(
-                            columns.get(key)
-                            for key in (
-                                "a_position",
-                                "z_position",
-                                "cable_type",
-                            )
-                        )
-                    ):
-                        default_sheet = ws.title
-                        break
-
-            finally:
-                workbook.close()
+                ):
+                    default_sheet = candidate
+                    break
 
             self.sheet_combo["values"] = sheet_names
             self.sheet_name.set(default_sheet)
@@ -4610,10 +5045,13 @@ class LabelGeneratorApp:
         except Exception as exc:
             self.sheet_combo["values"] = []
             self.sheet_name.set("")
-            self.status_text.set("Unable to read the selected workbook.")
+            self.status_text.set(
+                "Unable to read the selected workbook."
+            )
             messagebox.showerror(APP_NAME, str(exc))
         finally:
             self.stop_loading()
+
 
     def on_sheet_selected(self, event=None):
         self.start_loading("Loading worksheet...")
@@ -4627,7 +5065,6 @@ class LabelGeneratorApp:
         self.start_loading("Updating mapping...")
         try:
             self.refresh_sheet_status()
-            self.load_source_preview()
             self.load_output_preview()
             self.pulse_loading()
         finally:
@@ -4685,59 +5122,62 @@ class LabelGeneratorApp:
             return
 
         try:
-            self.pulse_loading()
-            workbook = load_workbook(source, data_only=True, read_only=True)
+            info = self.get_cached_sheet_info(
+                source,
+                sheet_name,
+                include_preview=False,
+            )
 
-            try:
-                ws = workbook[sheet_name]
-                header_row, auto_columns = find_header_columns(ws)
+            header_row = info.get("header_row")
+            auto_columns = info.get("auto_columns", {})
 
-                if not auto_columns:
-                    self.current_header_row = None
-                    self.current_auto_columns = {}
-                    self.status_text.set(
-                        f'{sheet_name}: required columns not detected.'
+            if not auto_columns:
+                self.current_header_row = None
+                self.current_auto_columns = {}
+                self.status_text.set(
+                    f'{sheet_name}: required columns not detected.'
+                )
+                return
+
+            self.current_header_row = header_row
+            self.current_auto_columns = dict(auto_columns)
+
+            choices = list(info.get("choices", []))
+            choice_by_col = dict(
+                info.get("choice_by_col", {})
+            )
+
+            for key, combo in self.mapping_combos.items():
+                combo_values = list(choices)
+
+                if key == "path":
+                    combo_values = ["(None)"] + combo_values
+
+                combo["values"] = combo_values
+
+                detected_col = auto_columns.get(key)
+
+                if detected_col:
+                    combo.set(
+                        choice_by_col.get(
+                            detected_col,
+                            "",
+                        )
                     )
-                    return
-
-                self.current_header_row = header_row
-                self.current_auto_columns = dict(auto_columns)
-
-                choices = []
-                choice_by_col = {}
-
-                for col_num in range(1, ws.max_column + 1):
-                    choice = self.column_choice(
-                        col_num,
-                        ws.cell(row=header_row, column=col_num).value,
-                    )
-                    choices.append(choice)
-                    choice_by_col[col_num] = choice
-
-                for key, combo in self.mapping_combos.items():
-                    combo_values = list(choices)
-                    if key == "path":
-                        combo_values = ["(None)"] + combo_values
-
-                    combo["values"] = combo_values
-
-                    detected_col = auto_columns.get(key)
-                    if detected_col:
-                        combo.set(choice_by_col[detected_col])
-                    elif key == "path":
-                        combo.set("(None)")
-                    else:
-                        combo.set("")
-
-            finally:
-                workbook.close()
+                elif key == "path":
+                    combo.set("(None)")
+                else:
+                    combo.set("")
 
             self.refresh_sheet_status()
             self.refresh_previews()
 
         except Exception as exc:
-            self.status_text.set("Unable to read the selected worksheet.")
+            self.status_text.set(
+                "Unable to read the selected worksheet."
+            )
             messagebox.showerror(APP_NAME, str(exc))
+
 
     def refresh_sheet_status(self):
         source = self.file_path.get().strip()
@@ -4749,7 +5189,7 @@ class LabelGeneratorApp:
         try:
             columns = self.get_selected_columns()
 
-            labels = extract_labels(
+            labels = self.cached_extract_labels(
                 source,
                 sheet_name,
                 header_row_override=self.current_header_row,
@@ -4809,7 +5249,7 @@ class LabelGeneratorApp:
 
         try:
             columns = self.get_selected_columns()
-            labels = extract_labels(
+            labels = self.cached_extract_labels(
                 source,
                 self.sheet_name.get().strip(),
                 header_row_override=self.current_header_row,
@@ -4830,7 +5270,14 @@ class LabelGeneratorApp:
         source_path = os.path.abspath(source)
         source_folder = os.path.dirname(source_path)
         source_name = os.path.splitext(os.path.basename(source_path))[0]
-        suggested_name = f"{source_name}_labels.xlsx"
+        worksheet_name = self.sanitize_filename_part(
+            self.sheet_name.get().strip()
+        )
+        suggested_name = (
+            f"{worksheet_name}_{source_name}_labels.xlsx"
+            if worksheet_name
+            else f"{source_name}_labels.xlsx"
+        )
 
         output_path = filedialog.asksaveasfilename(
             title="Save Label Excel File",
@@ -4909,7 +5356,7 @@ class LabelGeneratorApp:
 
         try:
             columns = self.get_selected_columns()
-            labels = extract_labels(
+            labels = self.cached_extract_labels(
                 source,
                 self.sheet_name.get().strip(),
                 header_row_override=self.current_header_row,
@@ -4930,7 +5377,14 @@ class LabelGeneratorApp:
         source_path = os.path.abspath(source)
         source_folder = os.path.dirname(source_path)
         source_name = os.path.splitext(os.path.basename(source_path))[0]
-        suggested_name = f"{source_name}_printable_labels.xlsx"
+        worksheet_name = self.sanitize_filename_part(
+            self.sheet_name.get().strip()
+        )
+        suggested_name = (
+            f"{worksheet_name}_{source_name}_printable_labels.xlsx"
+            if worksheet_name
+            else f"{source_name}_printable_labels.xlsx"
+        )
 
         output_path = filedialog.asksaveasfilename(
             title="Save Printable Label Excel File",
@@ -5010,7 +5464,7 @@ class LabelGeneratorApp:
 
         try:
             columns = self.get_selected_columns()
-            labels = extract_labels(
+            labels = self.cached_extract_labels(
                 source,
                 self.sheet_name.get().strip(),
                 header_row_override=self.current_header_row,
@@ -5031,7 +5485,14 @@ class LabelGeneratorApp:
         source_path = os.path.abspath(source)
         source_folder = os.path.dirname(source_path)
         source_name = os.path.splitext(os.path.basename(source_path))[0]
-        suggested_name = f"{source_name}_easymark.xlsx"
+        worksheet_name = self.sanitize_filename_part(
+            self.sheet_name.get().strip()
+        )
+        suggested_name = (
+            f"{worksheet_name}_{source_name}_easymark.xlsx"
+            if worksheet_name
+            else f"{source_name}_easymark.xlsx"
+        )
 
         output_path = filedialog.asksaveasfilename(
             title="Save Easy-Mark Excel File",
@@ -5102,13 +5563,18 @@ class LabelGeneratorApp:
         self.starting_cable_number.set("1")
         self.identifier.set("")
         self.other.set("")
-        self.clear_tree(self.source_preview)
         self.clear_tree(self.output_preview)
         self.status_text.set("Select an Excel file to begin.")
 
 
 def main():
-    root = tk.Tk()
+    set_windows_app_identity()
+
+    # className sets the X11/Wayland WM_CLASS used by Linux desktop
+    # environments for taskbar grouping/name matching.
+    root = tk.Tk(className="MTGCableTool")
+    root.title(APP_NAME)
+    root.iconname(APP_NAME)
 
     try:
         style = ttk.Style()
