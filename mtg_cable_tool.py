@@ -16,7 +16,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "MTG Cable Tool"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 EXTRACT_BLANK_ROW_STOP = 75
 
 # Union of worksheet source fields used anywhere in the application.
@@ -112,6 +112,7 @@ def header_matches(value, key):
         "cable_type": {
             "cabletype",
             "fibertype",
+            "cable",
         },
         "path": {
             "path",
