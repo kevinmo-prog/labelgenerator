@@ -16,7 +16,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "MTG Cable Tool"
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 EXTRACT_BLANK_ROW_STOP = 75
 
 # Union of worksheet source fields used anywhere in the application.
@@ -119,6 +119,17 @@ def header_matches(value, key):
             "cablepath",
         },
     }
+
+    # Path-style headers take precedence over the generic "Cable" alias.
+    # This prevents values such as "Cable Path" from being mistaken for
+    # Cable Type while still allowing a plain "Cable" header.
+    if key == "cable_type":
+        if normalized in aliases["path"] or normalized.endswith("path"):
+            return False
+
+    if key == "path":
+        if normalized in aliases["path"] or normalized.endswith("path"):
+            return True
 
     return normalized in aliases.get(key, set())
 
